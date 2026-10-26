@@ -50,24 +50,52 @@ int ObExprAIPrompt::calc_result_typeN(ObExprResType &type,
                                     common::ObExprTypeCtx &type_ctx) const 
 {
   int ret = OB_SUCCESS;
-  bool is_null_res = false;
-  ObExprResType template_type = types_stack[0];
-  if (!ob_is_string_tc(template_type.get_type())) {
-    ret = OB_ERR_INVALID_TYPE_FOR_OP;
+  if (OB_UNLIKELY(param_num < 1)) {
+    ObString func_name_(get_name());
+    ret = OB_ERR_PARAM_SIZE;
+    LOG_USER_ERROR(OB_ERR_PARAM_SIZE, func_name_.length(), func_name_.ptr());
   } else {
-    types_stack[0].set_calc_type(ObVarcharType);
-    types_stack[0].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
-  }
-
-  for (int64_t i = 1; i < param_num && OB_SUCC(ret); i++) {
-    if (ob_is_string_tc(types_stack[i].get_type())) {
-      types_stack[i].set_calc_type(ObVarcharType);
-      types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
-    } else if (ob_is_json(types_stack[i].get_type())) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "json type is not supported");
+    // The template may be a VARCHAR/CHAR or a TEXT/LONGTEXT column. Keep TEXT
+    // as-is (casting it to VARCHAR could truncate it) and read the real string
+    // data during evaluation.
+    ObObjType template_type = types_stack[0].get_type();
+    ObCollationType template_cs = types_stack[0].get_collation_type();
+    if (ob_is_string_tc(template_type)) {
+      // VARCHAR/CHAR and BINARY/VARBINARY are both accepted (the latter are
+      // treated as byte strings), matching the historical behaviour.
+      types_stack[0].set_calc_type(ObVarcharType);
+      types_stack[0].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else if (ob_is_text_tc(template_type)) {
+      if (ob_is_blob(template_type, template_cs)) {
+        // BLOB cannot be interpreted as a text template.
+        ret = OB_ERR_INVALID_TYPE_FOR_OP;
+      } else {
+        types_stack[0].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+      }
     } else {
       ret = OB_ERR_INVALID_TYPE_FOR_OP;
+    }
+
+    // Arguments may be strings, TEXT/LONGTEXT, JSON values (array/object/scalar)
+    // or a nested AI_PROMPT object.
+    for (int64_t i = 1; i < param_num && OB_SUCC(ret); i++) {
+      ObObjType arg_type = types_stack[i].get_type();
+      if (ob_is_string_tc(arg_type)) {
+        types_stack[i].set_calc_type(ObVarcharType);
+        types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+      } else if (ob_is_text_tc(arg_type)) {
+        if (ob_is_blob(arg_type, types_stack[i].get_collation_type())) {
+          ret = OB_ERR_INVALID_TYPE_FOR_OP;
+        } else {
+          types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+        }
+      } else if (ob_is_json(arg_type)) {
+        types_stack[i].set_calc_collation_type(CS_TYPE_UTF8MB4_BIN);
+      } else if (ob_is_json(arg_type)) {
+        // JSON argument: keep its type and let evaluation append the node.
+      } else {
+        ret = OB_ERR_INVALID_TYPE_FOR_OP;
+      }
     }
   }
 
@@ -91,11 +119,15 @@ int ObExprAIPrompt::eval_ai_prompt(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
   MultimodeAlloctor tmp_allocator(tmp_alloc_g.get_allocator());
   lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(N_AI_PROMPT));
 
-  if (OB_FAIL(tmp_allocator.eval_arg(arg0, ctx, template_datum))) {
+  if (OB_ISNULL(arg0)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(tmp_allocator.eval_arg(arg0, ctx, template_datum))) {
   } else if (template_datum->is_null()) {
     ret = OB_INVALID_ARGUMENT;
-  } else {
-    template_str = template_datum->get_string();
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_prompt: template is null");
+  } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+                 ctx.exec_ctx_, tmp_allocator, *template_datum, arg0->datum_meta_,
+                 arg0->obj_meta_.has_lob_header(), template_str))) {
   }
 
   if (OB_FAIL(ret)) {
@@ -107,15 +139,29 @@ int ObExprAIPrompt::eval_ai_prompt(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &
       ObString arg_str;
       ObJsonString *arg_json_str = NULL;
       if (OB_FAIL(tmp_allocator.eval_arg(arg, ctx, datum))) {
-      } else if (ob_is_string_tc(arg->datum_meta_.type_)) {
-        arg_str = datum->get_string();
-        if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(tmp_allocator, arg_str, arg_json_str))) {
+      } else if (ob_is_json(arg->datum_meta_.type_)) {
+        ObIJsonBase *j_base = NULL;
+        bool is_json_null = false;
+        if (datum->is_null()) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_prompt: json argument is null");
+        } else if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, tmp_allocator, i, j_base, is_json_null))) {
+        } else if (is_json_null || OB_ISNULL(j_base)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_prompt: json argument is null");
+        } else if (OB_FAIL(args_array->append(static_cast<ObJsonNode *>(j_base)))) {
+        }
+      } else if (ob_is_string_type(arg->datum_meta_.type_)) {
+        // A SQL NULL string argument is rendered as an empty string, keeping
+        // the previous behaviour of AI_PROMPT.
+        if (!datum->is_null() &&
+            OB_FAIL(ObTextStringHelper::read_real_string_data(
+                ctx.exec_ctx_, tmp_allocator, *datum, arg->datum_meta_,
+                arg->obj_meta_.has_lob_header(), arg_str))) {
+        } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_string(tmp_allocator, arg_str, arg_json_str))) {
         } else if (OB_FAIL(args_array->append(arg_json_str))) {
         }
-      } else if (ob_is_json(arg->datum_meta_.type_)) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "json type is not supported");
-      } else if (datum->is_null()) {
+      } else {
         ret = OB_ERR_INVALID_TYPE_FOR_OP;
       }
     }

@@ -77,7 +77,7 @@ int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString
 {
   int ret = OB_SUCCESS;
   int64_t remain_timeout_us = THIS_WORKER.is_timeout_ts_valid() ? THIS_WORKER.get_timeout_remain() : timeout_sec_ * 1000000;
-  if (OB_ISNULL(url) || headers.empty()) {
+  if (OB_ISNULL(url)) {
     ret = OB_INVALID_ARGUMENT;
   } else {
     allocator_ = &allocator;
@@ -212,7 +212,7 @@ int ObAIFuncClient::send_post(common::ObIAllocator &allocator,
 int ObAIFuncClient::send_post_batch(ObArray<ObJsonObject *> &data_array, ObArray<ObJsonObject *> &responses) 
 {
   int ret = OB_SUCCESS;
-  if (data_array.empty() || OB_ISNULL(url_) || OB_ISNULL(header_list_)) {
+  if (data_array.empty() || OB_ISNULL(url_)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_ISNULL(curlm_)) {
     if (OB_ISNULL(curlm_ = curl_multi_init())) {
@@ -281,6 +281,9 @@ int ObAIFuncClient::send_post_batch(common::ObIAllocator &allocator,
     }
     // retry if need
     for (int64_t i = 0; OB_SUCC(ret) && i < max_retry_times_; ++i) {
+      // A previous attempt may have appended partial responses. Clear them so
+      // the caller (and the order mapping) never sees duplicated entries.
+      responses.reset();
       ret = send_post_batch(data_array, responses);
       if (is_timeout()) {
         ret = OB_TIMEOUT;
@@ -299,7 +302,7 @@ int ObAIFuncClient::send_post_batch(common::ObIAllocator &allocator,
 int ObAIFuncClient::send_post_batch_no_wait(ObArray<ObJsonObject *> &data_array) 
 {
   int ret = OB_SUCCESS;
-  if (data_array.empty() || OB_ISNULL(url_) || OB_ISNULL(header_list_)) {
+  if (data_array.empty() || OB_ISNULL(url_)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_ISNULL(curlm_)) {
     if (OB_ISNULL(curlm_ = curl_multi_init())) {
@@ -358,7 +361,7 @@ int ObAIFuncClient::get_batch_result(ObArray<ObJsonObject *> &responses)
         if (res == CURLE_OK) {
           long response_code;
           curl_easy_getinfo(easy_handle, CURLINFO_RESPONSE_CODE, &response_code);
-          if (response_code != 200) {
+          if (response_code / 100 != 2) {
             ret = OB_CURL_ERROR;
           }
         }
